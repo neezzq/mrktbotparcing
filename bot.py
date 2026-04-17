@@ -24,6 +24,7 @@ from pyrogram.raw.types import InputBotAppShortName, InputUser
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0") or "0")
 API_ID = int(os.getenv("API_ID", "0") or "0")
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "mrkt_session").strip()
@@ -54,7 +55,9 @@ START_TEXT = (
     "/mygifts — показать мои фильтры\n"
     "/allgifts — получать все подарки\n"
     "/help — помощь\n\n"
-    "Пример: /gift Jester Hat"
+    "Пример: /gift Jester Hat
+
+После /start бот добавит тебя в подписчики."
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -224,6 +227,12 @@ class Storage:
 
 storage = Storage(DB_PATH)
 router = Router()
+
+
+def ensure_owner_subscribed() -> None:
+    if OWNER_CHAT_ID > 0:
+        storage.remember_user(OWNER_CHAT_ID, None)
+
 
 
 def require_env() -> None:
@@ -507,7 +516,7 @@ class MrktApi:
                 ),
             },
         )
-        self.tg = Client(SESSION_NAME, API_ID, API_HASH)
+        self.tg = Client(SESSION_NAME, API_ID, API_HASH, no_updates=True)
         await self.tg.start()
         return self
 
@@ -934,6 +943,7 @@ async def monitor_loop(bot: Bot) -> None:
 async def main() -> None:
     require_env()
     storage.init()
+    ensure_owner_subscribed()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
