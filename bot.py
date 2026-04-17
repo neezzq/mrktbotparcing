@@ -21,9 +21,6 @@ from curl_cffi.requests import AsyncSession
 
 load_dotenv()
 
-# =========================
-# ENV
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
@@ -35,31 +32,25 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "15"))
 DB_PATH = os.getenv("DB_PATH", "alerts.db").strip()
 
 MAX_PRICE_TON = float(os.getenv("MAX_PRICE_TON", "999999"))
-POLL_COUNT = int(os.getenv("POLL_COUNT", "20"))          # максимум 20
-AVG_SAMPLE_SIZE = int(os.getenv("AVG_SAMPLE_SIZE", "10"))  # сколько похожих листингов брать в avg
+POLL_COUNT = int(os.getenv("POLL_COUNT", "20"))
+AVG_SAMPLE_SIZE = int(os.getenv("AVG_SAMPLE_SIZE", "10"))
 TOKEN_REFRESH_SECONDS = int(os.getenv("TOKEN_REFRESH_SECONDS", "3600"))
 
-# фильтры; можно оставить пустыми
 FILTER_COLLECTIONS = [x.strip() for x in os.getenv("FILTER_COLLECTIONS", "").split(",") if x.strip()]
 FILTER_MODELS = [x.strip() for x in os.getenv("FILTER_MODELS", "").split(",") if x.strip()]
 FILTER_BACKDROPS = [x.strip() for x in os.getenv("FILTER_BACKDROPS", "").split(",") if x.strip()]
 FILTER_SYMBOLS = [x.strip() for x in os.getenv("FILTER_SYMBOLS", "").split(",") if x.strip()]
 
-# mini app данные
 MRKT_BOT_USERNAME = os.getenv("MRKT_BOT_USERNAME", "mrkt").strip()
 MRKT_APP_SHORT_NAME = os.getenv("MRKT_APP_SHORT_NAME", "app").strip()
 MRKT_PLATFORM = os.getenv("MRKT_PLATFORM", "android").strip()
 
-# если захочешь руками подложить токен
 MRKT_STATIC_TOKEN = os.getenv("MRKT_STATIC_TOKEN", "").strip()
 
 MARKET_API_URL = "https://api.tgmrkt.io/api/v1"
 MRKT_CDN_REFERER = "https://cdn.tgmrkt.io/"
 
 
-# =========================
-# LOGGING
-# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
@@ -67,9 +58,6 @@ logging.basicConfig(
 logger = logging.getLogger("mrktbot")
 
 
-# =========================
-# HELPERS
-# =========================
 def require_env() -> None:
     missing = []
     if not BOT_TOKEN:
@@ -80,7 +68,6 @@ def require_env() -> None:
         missing.append("API_ID")
     if not API_HASH:
         missing.append("API_HASH")
-
     if missing:
         raise RuntimeError(f"Не заполнены переменные: {', '.join(missing)}")
 
@@ -119,23 +106,17 @@ def mark_seen(unique_id: str) -> None:
 
 
 def safe_get(obj: Any, *keys: str, default=None):
-    """
-    Достаёт значение из dict/obj по нескольким возможным именам.
-    """
     if obj is None:
         return default
-
     for key in keys:
         if isinstance(obj, dict) and key in obj:
             val = obj.get(key)
             if val is not None:
                 return val
-
         if hasattr(obj, key):
             val = getattr(obj, key)
             if val is not None:
                 return val
-
     return default
 
 
@@ -149,14 +130,9 @@ def to_float(value: Any) -> Optional[float]:
 
 
 def to_ton(value: Any) -> Optional[float]:
-    """
-    Пытаемся привести цену к TON.
-    Если вдруг цена пришла в nanoTON, переводим.
-    """
     x = to_float(value)
     if x is None:
         return None
-
     if x > 1_000_000:
         return x / 1_000_000_000
     return x
@@ -173,11 +149,8 @@ def fmt_percent(value: Any) -> str:
     x = to_float(value)
     if x is None:
         return "—"
-
-    # если случайно пришло 0.013 вместо 1.3
     if 0 < x < 1:
         x = x * 100
-
     text = f"{x:.2f}".rstrip("0").rstrip(".")
     return f"{text}%"
 
@@ -304,9 +277,6 @@ def item_matches_filters(item: dict) -> bool:
     return True
 
 
-# =========================
-# MRKT API
-# =========================
 class MrktApi:
     def __init__(self) -> None:
         self.token: Optional[str] = MRKT_STATIC_TOKEN or None
@@ -347,16 +317,21 @@ class MrktApi:
         await self.refresh_token()
 
     async def get_init_data(self) -> str:
-        """
-        Получаем tgWebAppData из mini app MRKT.
-        """
         assert self.tg is not None
 
-        bot_entity = await self.tg.get_users(MRKT_BOT_USERNAME)
-        peer = await self.tg.resolve_peer(MRKT_BOT_USERNAME)
+        bot_peer = await self.tg.resolve_peer(MRKT_BOT_USERNAME)
 
-        bot = InputUser(user_id=bot_entity.id, access_hash=bot_entity.raw.access_hash)
-        bot_app = InputBotAppShortName(bot_id=bot, short_name=MRKT_APP_SHORT_NAME)
+        bot = InputUser(
+            user_id=bot_peer.user_id,
+            access_hash=bot_peer.access_hash
+        )
+
+        peer = bot_peer
+
+        bot_app = InputBotAppShortName(
+            bot_id=bot,
+            short_name=MRKT_APP_SHORT_NAME
+        )
 
         web_view = await self.tg.invoke(
             RequestAppWebView(
@@ -367,19 +342,18 @@ class MrktApi:
         )
 
         url = web_view.url
+
         if "tgWebAppData=" not in url:
-            raise RuntimeError("Не удалось получить tgWebAppData из URL mini app")
+            raise RuntimeError(f"tgWebAppData not found: {url}")
 
         init_data = unquote(url.split("tgWebAppData=", 1)[1].split("&tgWebAppVersion", 1)[0])
+
         if not init_data:
-            raise RuntimeError("tgWebAppData пустой")
+            raise RuntimeError("init_data empty")
 
         return init_data
 
     async def refresh_token(self) -> None:
-        """
-        POST /auth {"data": init_data}
-        """
         assert self.http is not None
 
         init_data = await self.get_init_data()
@@ -389,11 +363,7 @@ class MrktApi:
         resp.raise_for_status()
 
         data = resp.json()
-        token = None
-
-        if isinstance(data, dict):
-            token = data.get("token")
-
+        token = data.get("token") if isinstance(data, dict) else None
         if not token:
             raise RuntimeError(f"MRKT auth не вернул token. Ответ: {data}")
 
@@ -440,9 +410,6 @@ class MrktApi:
         count: int = 20,
         cursor: str = "",
     ) -> dict:
-        """
-        /gifts/saling
-        """
         payload = {
             "collectionNames": collection_names or [],
             "modelNames": model_names or [],
@@ -462,13 +429,7 @@ class MrktApi:
         return await self.post("/gifts/saling", payload)
 
 
-# =========================
-# AVG LOGIC
-# =========================
 async def calc_avg_sell(api: MrktApi, item: dict) -> Optional[float]:
-    """
-    Средняя цена продажи по активным похожим листингам.
-    """
     try:
         collection_name = extract_gift_name(item)
         model_name = extract_model_name(item)
@@ -499,13 +460,6 @@ async def calc_avg_sell(api: MrktApi, item: dict) -> Optional[float]:
 
 
 async def calc_avg_buy(api: MrktApi, item: dict, avg_sell: Optional[float]) -> Optional[float]:
-    """
-    У MRKT публично описан saling endpoint, а точная схема истории покупок в открытой доке не описана.
-    Поэтому здесь best-effort:
-    1) если в самом объекте есть stats/history-поля — используем их;
-    2) иначе возвращаем None.
-    """
-    # Пробуем найти что-то похожее на историю/среднюю покупку прямо в ответе
     for key in [
         "avgBuyPriceTon",
         "avg_buy_price_ton",
@@ -518,14 +472,9 @@ async def calc_avg_buy(api: MrktApi, item: dict, avg_sell: Optional[float]) -> O
         ton = to_ton(val)
         if ton is not None:
             return round(ton, 4)
-
-    # Можно сделать fallback на avg_sell, но это будет уже неточно.
     return None
 
 
-# =========================
-# MESSAGE
-# =========================
 def build_message(item: dict, avg_buy: Optional[float], avg_sell: Optional[float]) -> str:
     gift_name = extract_gift_name(item)
     gift_number = extract_gift_number(item)
@@ -581,16 +530,13 @@ async def send_alert(bot: Bot, item: dict, avg_buy: Optional[float], avg_sell: O
     )
 
 
-# =========================
-# MAIN LOOP
-# =========================
 async def process_market_page(bot: Bot, api: MrktApi) -> None:
     result = await api.fetch_saling(
         collection_names=FILTER_COLLECTIONS,
         model_names=FILTER_MODELS,
         backdrop_names=FILTER_BACKDROPS,
         symbol_names=FILTER_SYMBOLS,
-        ordering=None,   # None = ближе к "по времени выставления"
+        ordering=None,
         low_to_high=False,
         max_price=MAX_PRICE_TON if MAX_PRICE_TON < 999999 else None,
         count=POLL_COUNT,
@@ -599,7 +545,6 @@ async def process_market_page(bot: Bot, api: MrktApi) -> None:
     gifts = result.get("gifts", []) or []
     logger.info("Получено подарков: %s", len(gifts))
 
-    # Чтобы слать старые -> новые в более понятном порядке
     for item in reversed(gifts):
         try:
             if not item_matches_filters(item):
