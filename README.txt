@@ -1,5 +1,30 @@
-1) Укажи BOT_TOKEN в .env
-2) Укажи OWNER_CHAT_ID в .env, если хочешь сразу получать уведомления без /start
-3) Останови все старые экземпляры бота перед запуском
-4) Запуск вручную: cd /opt/mrktbot && source .venv/bin/activate && export LANG=C.UTF-8 && export LC_ALL=C.UTF-8 && export PYTHONIOENCODING=utf-8 && python bot.py
-5) Если ботом пользуются другие люди, они должны нажать /start
+Что внутри
+- bot.py
+- requirements.txt
+- .env.example
+
+Что реально сделано в этой версии
+- /start с текстом "Это бот для уведомлений о выходах подарков"
+- inline-меню фильтров
+- фильтр по подарку (ввод вручную)
+- фильтр по модели (ввод вручную)
+- фильтр по фону (ввод вручную)
+- фильтр по цене (мин/макс, ввод вручную)
+- фильтр по маркетам через inline-кнопки
+- подписка пользователя после /start
+- OWNER_CHAT_ID, чтобы владелец сразу получал алерты
+- мониторинг MRKT и рассылка по фильтрам
+
+Что НЕ обещаю врать что уже идеально работает
+- точный AVG Buy / AVG Sell по xGift / всем маркетам
+- полноценный парсинг Tonnel / GetGems / Portals без стабильных публичных эндпоинтов
+- прямое использование @xgift как API-источника: бот-к-боту через обычный Bot API так не работает
+
+Почему так
+- для много-маркетной аналитики и процентов по атрибутам есть Gift Asset API, который агрегирует multi-market data и provider stats, включая getgems / portals / tonnel, а также rarity атрибутов gift'ов. Но для него нужен API key, и без него нельзя честно заявлять, что эти источники уже подключены автоматически. Источник: GitHub/DOCS проекта Gift Asset API.
+
+Быстрый запуск
+1. Скопируй .env.example в .env и заполни
+2. Первый запуск делай вручную:
+   cd /opt/mrktbot && source .venv/bin/activate && export LANG=C.UTF-8 && export LC_ALL=C.UTF-8 && export PYTHONIOENCODING=utf-8 && python bot.py
+3. При первом запуске Pyrogram запросит номер/код Telegram и создаст mrkt_session.session
