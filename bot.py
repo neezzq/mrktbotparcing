@@ -55,9 +55,8 @@ START_TEXT = (
     "/mygifts — показать мои фильтры\n"
     "/allgifts — получать все подарки\n"
     "/help — помощь\n\n"
-    "Пример: /gift Jester Hat
-
-После /start бот добавит тебя в подписчики."
+    "Пример: /gift Jester Hat\n\n"
+    "После /start бот добавит тебя в подписчики."
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
