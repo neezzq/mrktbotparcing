@@ -1,0 +1,3 @@
+aiogram==3.20.0.post0
+python-dotenv==1.0.1
+amrkt==1.6.0
