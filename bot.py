@@ -1,63 +1,99 @@
-
 import asyncio
 import html
+import json
 import logging
 import os
+import re
 import sqlite3
 import time
-from pathlib import Path
+from statistics import mean
 from typing import Any, Optional
+from urllib.parse import unquote
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 from pyrogram import Client
 from pyrogram.raw.functions.messages import RequestAppWebView
 from pyrogram.raw.types import InputBotAppShortName, InputUser
-from curl_cffi.requests import AsyncSession
-from urllib.parse import unquote
-
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0") or 0)
-
-API_ID = int(os.getenv("API_ID", "0") or 0)
+API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "mrkt_session").strip()
-
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "15") or 15)
+OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0") or 0)
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "15"))
 DB_PATH = os.getenv("DB_PATH", "alerts.db").strip()
-
 MRKT_BOT_USERNAME = os.getenv("MRKT_BOT_USERNAME", "mrkt").strip()
 MRKT_APP_SHORT_NAME = os.getenv("MRKT_APP_SHORT_NAME", "app").strip()
 MRKT_PLATFORM = os.getenv("MRKT_PLATFORM", "android").strip()
-MRKT_STATIC_TOKEN = os.getenv("MRKT_STATIC_TOKEN", "").strip()
-
-TOKEN_REFRESH_SECONDS = int(os.getenv("TOKEN_REFRESH_SECONDS", "3600") or 3600)
-
+TOKEN_REFRESH_SECONDS = int(os.getenv("TOKEN_REFRESH_SECONDS", "3600"))
 MARKET_API_URL = "https://api.tgmrkt.io/api/v1"
 MRKT_CDN_REFERER = "https://cdn.tgmrkt.io/"
+PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "20"))
+STARTUP_TEST = os.getenv("SEND_STARTUP_TEST", "0").strip() == "1"
 
-MARKETS = ["mrkt", "tonnel", "getgems", "portals"]
+SUPPORTED_MARKETS = ["MRKT", "Tonnel", "GetGems", "Portals", "xGift"]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("mrktbot")
+
+
+def esc(v: Any) -> str:
+    return html.escape("" if v is None else str(v))
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", name or "")
+
+
+def to_float(value: Any) -> Optional[float]:
+    if value in (None, "", "None"):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def to_ton(value: Any) -> Optional[float]:
+    x = to_float(value)
+    if x is None:
+        return None
+    if x > 1_000_000:
+        return x / 1_000_000_000
+    return x
+
+
+def fmt_ton(value: Any) -> str:
+    x = to_ton(value)
+    if x is None:
+        return "—"
+    return f"{x:.2f} TON"
+
+
+def fmt_percent(value: Any) -> str:
+    x = to_float(value)
+    if x is None:
+        return "—"
+    if 0 < x < 1:
+        x *= 100
+    return f"{x:.2f}".rstrip("0").rstrip(".") + "%"
+
+
+def build_tme_url(gift_name: str, gift_number: Any) -> Optional[str]:
+    if not gift_name or gift_number is None:
+        return None
+    return f"https://t.me/nft/{slugify(gift_name)}-{gift_number}"
 
 
 class InputStates(StatesGroup):
@@ -72,156 +108,143 @@ class DB:
     def __init__(self, path: str):
         self.path = path
 
-    def connect(self):
+    def conn(self):
         return sqlite3.connect(self.path)
 
     def init(self):
-        conn = self.connect()
+        conn = self.conn()
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
                 chat_id INTEGER PRIMARY KEY,
                 is_active INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS filters (
-                chat_id INTEGER PRIMARY KEY,
-                gift_name TEXT DEFAULT '',
-                model_name TEXT DEFAULT '',
-                backdrop_name TEXT DEFAULT '',
+                gift_filter TEXT,
+                model_filter TEXT,
+                backdrop_filter TEXT,
                 min_price REAL,
                 max_price REAL,
-                markets TEXT DEFAULT 'mrkt',
+                markets_json TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS seen_items (
-                unique_id TEXT PRIMARY KEY,
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seen_listings (
+                uniq TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL
             )
-        """)
+            """
+        )
         conn.commit()
         conn.close()
 
-    def upsert_user(self, chat_id: int):
+    def ensure_user(self, chat_id: int):
         now = int(time.time())
-        conn = self.connect()
+        conn = self.conn()
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO users(chat_id, is_active, created_at, updated_at)
             VALUES(?, 1, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET is_active=1, updated_at=excluded.updated_at
-        """, (chat_id, now, now))
-        cur.execute("""
-            INSERT INTO filters(chat_id, created_at, updated_at)
-            VALUES(?, ?, ?)
-            ON CONFLICT(chat_id) DO NOTHING
-        """, (chat_id, now, now))
+            """,
+            (chat_id, now, now),
+        )
         conn.commit()
         conn.close()
 
-    def list_active_users(self) -> list[int]:
-        conn = self.connect()
+    def get_user(self, chat_id: int) -> dict:
+        conn = self.conn()
+        conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("SELECT chat_id FROM users WHERE is_active = 1")
-        rows = [r[0] for r in cur.fetchall()]
-        conn.close()
-        return rows
-
-    def get_filter(self, chat_id: int) -> dict:
-        conn = self.connect()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT gift_name, model_name, backdrop_name, min_price, max_price, markets
-            FROM filters WHERE chat_id = ?
-        """, (chat_id,))
+        cur.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,))
         row = cur.fetchone()
         conn.close()
         if not row:
-            now = int(time.time())
-            conn = self.connect()
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT OR IGNORE INTO filters(chat_id, created_at, updated_at, markets)
-                VALUES(?, ?, ?, 'mrkt')
-            """, (chat_id, now, now))
-            conn.commit()
-            conn.close()
-            return {
-                "gift_name": "",
-                "model_name": "",
-                "backdrop_name": "",
-                "min_price": None,
-                "max_price": None,
-                "markets": "mrkt",
-            }
-        return {
-            "gift_name": row[0] or "",
-            "model_name": row[1] or "",
-            "backdrop_name": row[2] or "",
-            "min_price": row[3],
-            "max_price": row[4],
-            "markets": row[5] or "mrkt",
-        }
+            self.ensure_user(chat_id)
+            return self.get_user(chat_id)
+        data = dict(row)
+        try:
+            data["markets"] = json.loads(data.get("markets_json") or "[]")
+        except Exception:
+            data["markets"] = []
+        return data
 
-    def update_filter_value(self, chat_id: int, field: str, value: Any):
-        now = int(time.time())
-        conn = self.connect()
+    def set_field(self, chat_id: int, field: str, value: Any):
+        allowed = {"gift_filter", "model_filter", "backdrop_filter", "min_price", "max_price", "markets_json", "is_active"}
+        if field not in allowed:
+            raise ValueError("bad field")
+        conn = self.conn()
         cur = conn.cursor()
-        cur.execute(f"""
-            UPDATE filters SET {field} = ?, updated_at = ? WHERE chat_id = ?
-        """, (value, now, chat_id))
+        cur.execute(f"UPDATE users SET {field}=?, updated_at=? WHERE chat_id=?", (value, int(time.time()), chat_id))
         conn.commit()
         conn.close()
 
     def toggle_market(self, chat_id: int, market: str):
-        data = self.get_filter(chat_id)
-        markets = set([m for m in (data["markets"] or "").split(",") if m])
+        user = self.get_user(chat_id)
+        markets = set(user.get("markets") or [])
         if market in markets:
             markets.remove(market)
         else:
             markets.add(market)
-        if not markets:
-            markets.add("mrkt")
-        self.update_filter_value(chat_id, "markets", ",".join(sorted(markets)))
+        self.set_field(chat_id, "markets_json", json.dumps(sorted(markets), ensure_ascii=False))
 
-    def reset_filters(self, chat_id: int):
-        now = int(time.time())
-        conn = self.connect()
+    def clear_filters(self, chat_id: int):
+        conn = self.conn()
         cur = conn.cursor()
-        cur.execute("""
-            UPDATE filters
-            SET gift_name='',
-                model_name='',
-                backdrop_name='',
-                min_price=NULL,
-                max_price=NULL,
-                markets='mrkt',
-                updated_at=?
+        cur.execute(
+            """
+            UPDATE users
+            SET gift_filter=NULL, model_filter=NULL, backdrop_filter=NULL,
+                min_price=NULL, max_price=NULL, markets_json='[]', updated_at=?
             WHERE chat_id=?
-        """, (now, chat_id))
+            """,
+            (int(time.time()), chat_id),
+        )
         conn.commit()
         conn.close()
 
-    def is_seen(self, unique_id: str) -> bool:
-        conn = self.connect()
+    def subscribers(self) -> list[dict]:
+        conn = self.conn()
+        conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM seen_items WHERE unique_id = ?", (unique_id,))
-        row = cur.fetchone()
+        cur.execute("SELECT * FROM users WHERE is_active=1")
+        rows = [dict(r) for r in cur.fetchall()]
         conn.close()
-        return row is not None
+        out = []
+        for r in rows:
+            try:
+                r["markets"] = json.loads(r.get("markets_json") or "[]")
+            except Exception:
+                r["markets"] = []
+            out.append(r)
+        if OWNER_CHAT_ID and all(r["chat_id"] != OWNER_CHAT_ID for r in out):
+            out.append({
+                "chat_id": OWNER_CHAT_ID,
+                "gift_filter": None,
+                "model_filter": None,
+                "backdrop_filter": None,
+                "min_price": None,
+                "max_price": None,
+                "markets": [],
+            })
+        return out
 
-    def mark_seen(self, unique_id: str):
-        conn = self.connect()
+    def seen(self, uniq: str) -> bool:
+        conn = self.conn()
         cur = conn.cursor()
-        cur.execute("""
-            INSERT OR IGNORE INTO seen_items(unique_id, created_at) VALUES(?, ?)
-        """, (unique_id, int(time.time())))
+        cur.execute("SELECT 1 FROM seen_listings WHERE uniq=?", (uniq,))
+        ok = cur.fetchone() is not None
+        conn.close()
+        return ok
+
+    def mark_seen(self, uniq: str):
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO seen_listings(uniq, created_at) VALUES(?, ?)", (uniq, int(time.time())))
         conn.commit()
         conn.close()
 
@@ -229,151 +252,9 @@ class DB:
 db = DB(DB_PATH)
 
 
-def esc(v: Any) -> str:
-    return html.escape("" if v is None else str(v))
-
-
-def fmt_price(v: Any) -> str:
-    if v is None:
-        return "—"
-    return f"{float(v):.2f} TON"
-
-
-def fmt_percent(v: Any) -> str:
-    if v is None:
-        return "—"
-    try:
-        x = float(v)
-        if 0 < x < 1:
-            x *= 100
-        return f"{x:.2f}".rstrip("0").rstrip(".") + "%"
-    except Exception:
-        return "—"
-
-
-def build_tme_url(gift_name: str, gift_number: Any) -> Optional[str]:
-    if not gift_name or gift_number is None:
-        return None
-    slug = "".join(ch for ch in gift_name if ch.isalnum())
-    return f"https://t.me/nft/{slug}-{gift_number}"
-
-
-def extract_unique_id(item: dict) -> str:
-    return str(item.get("saleId") or item.get("id") or f'{item.get("collectionName","gift")}-{item.get("giftNum","0")}-{item.get("price","0")}')
-
-def extract_gift_name(item: dict) -> str:
-    return item.get("collectionName") or item.get("name") or "Unknown Gift"
-
-def extract_gift_number(item: dict) -> Any:
-    return item.get("giftNum") or item.get("number") or "—"
-
-def extract_price(item: dict) -> Optional[float]:
-    price = item.get("priceTon")
-    if price is None:
-        price = item.get("price")
-    try:
-        if price is None:
-            return None
-        val = float(price)
-        if val > 1_000_000:
-            return val / 1_000_000_000
-        return val
-    except Exception:
-        return None
-
-def extract_model(item: dict) -> str:
-    return item.get("modelName") or item.get("model") or "—"
-
-def extract_model_percent(item: dict) -> Any:
-    return item.get("modelRarityPercent") or item.get("model_rarity_percent") or item.get("modelRarity")
-
-def extract_backdrop(item: dict) -> str:
-    return item.get("backdropName") or item.get("backdrop") or "—"
-
-def extract_backdrop_percent(item: dict) -> Any:
-    return (
-        item.get("backdropRarityPercent")
-        or item.get("backdrop_rarity_percent")
-        or item.get("backgroundRarityPercent")
-        or item.get("background_rarity_percent")
-        or item.get("backdropRarity")
-    )
-
-def extract_symbol(item: dict) -> str:
-    return item.get("symbolName") or item.get("symbol") or "—"
-
-def extract_symbol_percent(item: dict) -> Any:
-    return item.get("symbolRarityPercent") or item.get("symbol_rarity_percent") or item.get("symbolRarity")
-
-
-def parse_markets(value: str) -> list[str]:
-    return [m for m in (value or "").split(",") if m]
-
-
-def filter_matches(item: dict, f: dict) -> bool:
-    gift_name = f["gift_name"].strip().lower()
-    model_name = f["model_name"].strip().lower()
-    backdrop_name = f["backdrop_name"].strip().lower()
-    min_price = f["min_price"]
-    max_price = f["max_price"]
-    markets = set(parse_markets(f["markets"]))
-
-    item_market = "mrkt"
-    if markets and item_market not in markets:
-        return False
-
-    if gift_name and gift_name not in extract_gift_name(item).lower():
-        return False
-    if model_name and model_name not in extract_model(item).lower():
-        return False
-    if backdrop_name and backdrop_name not in extract_backdrop(item).lower():
-        return False
-
-    price = extract_price(item)
-    if price is None:
-        return False
-    if min_price is not None and price < float(min_price):
-        return False
-    if max_price is not None and price > float(max_price):
-        return False
-
-    return True
-
-
-def main_menu(chat_id: int) -> InlineKeyboardMarkup:
-    f = db.get_filter(chat_id)
-    markets = set(parse_markets(f["markets"]))
-    rows = [
-        [InlineKeyboardButton(text="🎁 Подарок", callback_data="set:gift"),
-         InlineKeyboardButton(text="🧩 Модель", callback_data="set:model")],
-        [InlineKeyboardButton(text="🖼 Фон", callback_data="set:backdrop"),
-         InlineKeyboardButton(text="💰 Цена", callback_data="set:price")],
-        [InlineKeyboardButton(text=f'{"✅" if "mrkt" in markets else "⬜"} MRKT', callback_data="market:mrkt"),
-         InlineKeyboardButton(text=f'{"✅" if "tonnel" in markets else "⬜"} Tonnel', callback_data="market:tonnel")],
-        [InlineKeyboardButton(text=f'{"✅" if "getgems" in markets else "⬜"} GetGems', callback_data="market:getgems"),
-         InlineKeyboardButton(text=f'{"✅" if "portals" in markets else "⬜"} Portals', callback_data="market:portals")],
-        [InlineKeyboardButton(text="📋 Мои фильтры", callback_data="show:filters"),
-         InlineKeyboardButton(text="🧹 Сбросить", callback_data="reset:filters")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def filters_text(chat_id: int) -> str:
-    f = db.get_filter(chat_id)
-    return (
-        "Текущие фильтры:\n\n"
-        f"🎁 Подарок: {f['gift_name'] or '—'}\n"
-        f"🧩 Модель: {f['model_name'] or '—'}\n"
-        f"🖼 Фон: {f['backdrop_name'] or '—'}\n"
-        f"💰 Мин. цена: {f['min_price'] if f['min_price'] is not None else '—'}\n"
-        f"💰 Макс. цена: {f['max_price'] if f['max_price'] is not None else '—'}\n"
-        f"🏪 Маркеты: {', '.join(parse_markets(f['markets'])) or 'mrkt'}"
-    )
-
-
 class MrktApi:
     def __init__(self):
-        self.token: Optional[str] = MRKT_STATIC_TOKEN or None
+        self.token: Optional[str] = None
         self.token_received_at = 0.0
         self.http: Optional[AsyncSession] = None
         self.tg: Optional[Client] = None
@@ -388,11 +269,7 @@ class MrktApi:
                 "Content-Type": "application/json;charset=UTF-8",
                 "Origin": "https://cdn.tgmrkt.io",
                 "Referer": MRKT_CDN_REFERER,
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
+                "User-Agent": "Mozilla/5.0",
             },
         )
         self.tg = Client(SESSION_NAME, API_ID, API_HASH, no_updates=True)
@@ -415,11 +292,8 @@ class MrktApi:
         )
         url = web_view.url
         if "tgWebAppData=" not in url:
-            raise RuntimeError(f"tgWebAppData not found: {url}")
-        init_data = unquote(url.split("tgWebAppData=", 1)[1].split("&tgWebAppVersion", 1)[0])
-        if not init_data:
-            raise RuntimeError("init_data empty")
-        return init_data
+            raise RuntimeError("tgWebAppData not found")
+        return unquote(url.split("tgWebAppData=", 1)[1].split("&tgWebAppVersion", 1)[0])
 
     async def refresh_token(self):
         assert self.http is not None
@@ -429,268 +303,344 @@ class MrktApi:
         data = resp.json()
         token = data.get("token") if isinstance(data, dict) else None
         if not token:
-            raise RuntimeError(f"MRKT auth failed: {data}")
+            raise RuntimeError(f"No token in auth response: {data}")
         self.token = token
         self.token_received_at = time.time()
         logger.info("MRKT token refreshed")
 
     async def ensure_token(self):
-        if self.token and (time.time() - self.token_received_at) < TOKEN_REFRESH_SECONDS:
+        if self.token and time.time() - self.token_received_at < TOKEN_REFRESH_SECONDS:
             return
         await self.refresh_token()
 
     async def post(self, path: str, payload: dict) -> dict:
         assert self.http is not None
         await self.ensure_token()
-        headers = {
-            "Authorization": self.token or "",
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json;charset=UTF-8",
-            "Origin": "https://cdn.tgmrkt.io",
-            "Referer": MRKT_CDN_REFERER,
-        }
+        headers = {"Authorization": self.token or "", "Referer": MRKT_CDN_REFERER, "Origin": "https://cdn.tgmrkt.io"}
         resp = await self.http.post(f"{MARKET_API_URL}{path}", headers=headers, json=payload)
         if resp.status_code == 401:
             await self.refresh_token()
             headers["Authorization"] = self.token or ""
             resp = await self.http.post(f"{MARKET_API_URL}{path}", headers=headers, json=payload)
-        if resp.status_code >= 400:
-            body = getattr(resp, "text", "")
-            raise RuntimeError(f"MRKT HTTP {resp.status_code} | path={path} | payload={payload} | body={body}")
+        resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
-            raise RuntimeError(f"bad response: {data}")
+            raise RuntimeError(f"Bad response: {data}")
         return data
 
-    async def fetch_saling(self, count: int = 20) -> list[dict]:
+    async def fetch_saling(self, count: int = 20, gift: Optional[str] = None, model: Optional[str] = None, backdrop: Optional[str] = None,
+                           min_price_ton: Optional[float] = None, max_price_ton: Optional[float] = None, cursor: str = "") -> dict:
         payload = {
-            "collectionNames": [],
-            "modelNames": [],
-            "backdropNames": [],
+            "collectionNames": [gift] if gift else [],
+            "modelNames": [model] if model else [],
+            "backdropNames": [backdrop] if backdrop else [],
             "symbolNames": [],
-            "count": count,
-            "cursor": "",
-            "promotedFirst": False,
+            "ordering": "None",
             "lowToHigh": False,
-            "ordering": "Date"
+            "maxPrice": int(max_price_ton * 1_000_000_000) if max_price_ton else None,
+            "minPrice": int(min_price_ton * 1_000_000_000) if min_price_ton else None,
+            "mintable": None,
+            "number": None,
+            "count": min(max(count, 1), 20),
+            "cursor": cursor,
+            "query": None,
+            "promotedFirst": False,
         }
-        try:
-            data = await self.post("/gifts/saling", payload)
-        except Exception:
-            payload["ordering"] = "Price"
-            payload["lowToHigh"] = True
-            data = await self.post("/gifts/saling", payload)
-        gifts = data.get("gifts", [])
-        return gifts if isinstance(gifts, list) else []
+        logger.info("MRKT /gifts/saling payload: %s", payload)
+        return await self.post("/gifts/saling", payload)
 
 
-async def send_item(bot: Bot, chat_id: int, item: dict):
-    gift_name = extract_gift_name(item)
-    gift_number = extract_gift_number(item)
-    price = extract_price(item)
-    model = extract_model(item)
-    model_p = extract_model_percent(item)
-    backdrop = extract_backdrop(item)
-    backdrop_p = extract_backdrop_percent(item)
-    symbol = extract_symbol(item)
-    symbol_p = extract_symbol_percent(item)
-    tme = build_tme_url(gift_name, gift_number)
+def extract_from_mrkt(item: dict) -> dict:
+    gift_name = item.get("collectionName") or item.get("name") or item.get("giftName") or "Unknown Gift"
+    gift_number = item.get("giftNum") or item.get("number")
+    model = item.get("modelName") or item.get("model") or "Unknown"
+    backdrop = item.get("backdropName") or item.get("backdrop") or "Unknown"
+    symbol = item.get("symbolName") or item.get("symbol") or "Unknown"
+    price = to_ton(item.get("priceTon") or item.get("salePriceTon") or item.get("price") or item.get("salePrice"))
+    return {
+        "provider": "MRKT",
+        "uniq": f"mrkt:{item.get('id') or item.get('saleId') or gift_name}:{gift_number}:{price}",
+        "gift_name": gift_name,
+        "gift_number": gift_number,
+        "model_name": model,
+        "model_percent": item.get("modelRarityPercent") or item.get("modelRarity"),
+        "backdrop_name": backdrop,
+        "backdrop_percent": item.get("backdropRarityPercent") or item.get("backgroundRarityPercent") or item.get("backdropRarity"),
+        "symbol_name": symbol,
+        "symbol_percent": item.get("symbolRarityPercent") or item.get("symbolRarity"),
+        "price_ton": price,
+        "avg_buy_ton": None,
+        "avg_sell_ton": None,
+        "market_url": item.get("url") or item.get("saleUrl") or item.get("marketUrl"),
+        "tme_url": build_tme_url(gift_name, gift_number),
+        "raw": item,
+    }
 
-    text = (
-        f"<b>{esc(gift_name)} #{esc(gift_number)}</b>\n\n"
-        f"- Model: {esc(model)} ({fmt_percent(model_p)})\n"
-        f"- Symbol: {esc(symbol)} ({fmt_percent(symbol_p)})\n"
-        f"- Backdrop: {esc(backdrop)} ({fmt_percent(backdrop_p)})\n\n"
-        f"🪙 Price: {fmt_price(price)}\n"
-        f"📉 Avg buy: —\n"
-        f"📈 Avg sell: —\n\n"
-        f"{esc(tme) if tme else ''}"
+
+async def calc_avg_sell_mrkt(api: MrktApi, listing: dict) -> Optional[float]:
+    try:
+        resp = await api.fetch_saling(
+            count=10,
+            gift=listing["gift_name"] if listing.get("gift_name") else None,
+            model=listing["model_name"] if listing.get("model_name") and listing["model_name"] != "Unknown" else None,
+            backdrop=listing["backdrop_name"] if listing.get("backdrop_name") and listing["backdrop_name"] != "Unknown" else None,
+        )
+        gifts = resp.get("gifts", []) or []
+        vals = [to_ton((g.get("priceTon") or g.get("salePriceTon") or g.get("price") or g.get("salePrice"))) for g in gifts]
+        vals = [v for v in vals if v is not None]
+        return round(mean(vals), 4) if vals else None
+    except Exception as e:
+        logger.warning("avg sell calc failed: %s", e)
+        return None
+
+
+def user_matches(user: dict, listing: dict) -> bool:
+    markets = set(user.get("markets") or [])
+    if markets and listing["provider"] not in markets:
+        return False
+    gift_filter = (user.get("gift_filter") or "").strip().lower()
+    if gift_filter and gift_filter not in (listing.get("gift_name") or "").lower():
+        return False
+    model_filter = (user.get("model_filter") or "").strip().lower()
+    if model_filter and model_filter not in (listing.get("model_name") or "").lower():
+        return False
+    backdrop_filter = (user.get("backdrop_filter") or "").strip().lower()
+    if backdrop_filter and backdrop_filter not in (listing.get("backdrop_name") or "").lower():
+        return False
+    min_price = user.get("min_price")
+    if min_price is not None and listing.get("price_ton") is not None and listing["price_ton"] < float(min_price):
+        return False
+    max_price = user.get("max_price")
+    if max_price is not None and listing.get("price_ton") is not None and listing["price_ton"] > float(max_price):
+        return False
+    return True
+
+
+def settings_text(user: dict) -> str:
+    markets = ", ".join(user.get("markets") or []) or "Все"
+    return (
+        "<b>Это бот для уведомлений о выходах подарков</b>\n\n"
+        f"<b>Подарок:</b> {esc(user.get('gift_filter') or 'Все')}\n"
+        f"<b>Модель:</b> {esc(user.get('model_filter') or 'Все')}\n"
+        f"<b>Фон:</b> {esc(user.get('backdrop_filter') or 'Все')}\n"
+        f"<b>Мин. цена:</b> {esc(user.get('min_price') if user.get('min_price') is not None else '—')}\n"
+        f"<b>Макс. цена:</b> {esc(user.get('max_price') if user.get('max_price') is not None else '—')}\n"
+        f"<b>Маркеты:</b> {esc(markets)}"
     )
-    kb = []
-    if tme:
-        kb.append([InlineKeyboardButton(text="Открыть подарок", url=tme)])
-    markup = InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
-    await bot.send_message(chat_id, text, reply_markup=markup, disable_web_page_preview=False)
 
 
-async def monitor_loop(bot: Bot):
-    if OWNER_CHAT_ID:
-        db.upsert_user(OWNER_CHAT_ID)
+def main_menu(chat_id: int) -> InlineKeyboardMarkup:
+    user = db.get_user(chat_id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎁 Подарок", callback_data="set:gift")
+    kb.button(text="🧬 Модель", callback_data="set:model")
+    kb.button(text="🖼 Фон", callback_data="set:backdrop")
+    kb.button(text="💸 Мин. цена", callback_data="set:min_price")
+    kb.button(text="💰 Макс. цена", callback_data="set:max_price")
+    kb.button(text="🏪 Маркеты", callback_data="menu:markets")
+    kb.button(text="🗑 Сбросить фильтры", callback_data="reset:all")
+    kb.adjust(2, 2, 2, 1)
+    return kb.as_markup()
 
+
+def markets_menu(chat_id: int) -> InlineKeyboardMarkup:
+    user = db.get_user(chat_id)
+    selected = set(user.get("markets") or [])
+    kb = InlineKeyboardBuilder()
+    for market in SUPPORTED_MARKETS:
+        mark = "✅" if market in selected else "☑️"
+        kb.button(text=f"{mark} {market}", callback_data=f"toggle_market:{market}")
+    kb.button(text="⬅️ Назад", callback_data="menu:main")
+    kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+def listing_text(item: dict) -> str:
+    return (
+        f"<b>{esc(item['gift_name'])} #{esc(item['gift_number'])}</b>\n"
+        f"<b>Маркет:</b> {esc(item['provider'])}\n\n"
+        f"- Model: {esc(item['model_name'])} ({fmt_percent(item.get('model_percent'))})\n"
+        f"- Symbol: {esc(item['symbol_name'])} ({fmt_percent(item.get('symbol_percent'))})\n"
+        f"- Backdrop: {esc(item['backdrop_name'])} ({fmt_percent(item.get('backdrop_percent'))})\n\n"
+        f"🪙 Price: {fmt_ton(item.get('price_ton'))}\n"
+        f"📉 Avg buy: {fmt_ton(item.get('avg_buy_ton'))}\n"
+        f"📈 Avg sell: {fmt_ton(item.get('avg_sell_ton'))}"
+    )
+
+
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    db.ensure_user(message.chat.id)
+    await message.answer(settings_text(db.get_user(message.chat.id)), reply_markup=main_menu(message.chat.id))
+
+
+@dp.callback_query(F.data == "menu:main")
+async def cb_menu_main(call: CallbackQuery):
+    await call.message.edit_text(settings_text(db.get_user(call.message.chat.id)), reply_markup=main_menu(call.message.chat.id))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "menu:markets")
+async def cb_markets(call: CallbackQuery):
+    await call.message.edit_text("Выбери маркеты для уведомлений:", reply_markup=markets_menu(call.message.chat.id))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("toggle_market:"))
+async def cb_toggle_market(call: CallbackQuery):
+    market = call.data.split(":", 1)[1]
+    db.ensure_user(call.message.chat.id)
+    db.toggle_market(call.message.chat.id, market)
+    await call.message.edit_reply_markup(reply_markup=markets_menu(call.message.chat.id))
+    await call.answer("Сохранено")
+
+
+@dp.callback_query(F.data == "reset:all")
+async def cb_reset(call: CallbackQuery):
+    db.clear_filters(call.message.chat.id)
+    await call.message.edit_text(settings_text(db.get_user(call.message.chat.id)), reply_markup=main_menu(call.message.chat.id))
+    await call.answer("Фильтры сброшены")
+
+
+@dp.callback_query(F.data == "set:gift")
+async def cb_set_gift(call: CallbackQuery, state: FSMContext):
+    await state.set_state(InputStates.gift)
+    await call.message.answer("Введи подарок вручную. Пример: <code>Jester Hat</code>\nЧтобы убрать фильтр — отправь <code>-</code>")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "set:model")
+async def cb_set_model(call: CallbackQuery, state: FSMContext):
+    await state.set_state(InputStates.model)
+    await call.message.answer("Введи модель вручную. Пример: <code>Funster</code>\nЧтобы убрать фильтр — отправь <code>-</code>")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "set:backdrop")
+async def cb_set_backdrop(call: CallbackQuery, state: FSMContext):
+    await state.set_state(InputStates.backdrop)
+    await call.message.answer("Введи фон вручную. Пример: <code>Silver Blue</code>\nЧтобы убрать фильтр — отправь <code>-</code>")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "set:min_price")
+async def cb_set_min_price(call: CallbackQuery, state: FSMContext):
+    await state.set_state(InputStates.min_price)
+    await call.message.answer("Введи минимальную цену в TON. Пример: <code>1.5</code>\nЧтобы убрать фильтр — отправь <code>-</code>")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "set:max_price")
+async def cb_set_max_price(call: CallbackQuery, state: FSMContext):
+    await state.set_state(InputStates.max_price)
+    await call.message.answer("Введи максимальную цену в TON. Пример: <code>10</code>\nЧтобы убрать фильтр — отправь <code>-</code>")
+    await call.answer()
+
+
+@dp.message(InputStates.gift)
+async def st_gift(message: Message, state: FSMContext):
+    db.ensure_user(message.chat.id)
+    db.set_field(message.chat.id, "gift_filter", None if message.text.strip() == "-" else message.text.strip())
+    await state.clear()
+    await message.answer(settings_text(db.get_user(message.chat.id)), reply_markup=main_menu(message.chat.id))
+
+
+@dp.message(InputStates.model)
+async def st_model(message: Message, state: FSMContext):
+    db.ensure_user(message.chat.id)
+    db.set_field(message.chat.id, "model_filter", None if message.text.strip() == "-" else message.text.strip())
+    await state.clear()
+    await message.answer(settings_text(db.get_user(message.chat.id)), reply_markup=main_menu(message.chat.id))
+
+
+@dp.message(InputStates.backdrop)
+async def st_backdrop(message: Message, state: FSMContext):
+    db.ensure_user(message.chat.id)
+    db.set_field(message.chat.id, "backdrop_filter", None if message.text.strip() == "-" else message.text.strip())
+    await state.clear()
+    await message.answer(settings_text(db.get_user(message.chat.id)), reply_markup=main_menu(message.chat.id))
+
+
+@dp.message(InputStates.min_price)
+async def st_min_price(message: Message, state: FSMContext):
+    db.ensure_user(message.chat.id)
+    value = None if message.text.strip() == "-" else to_float(message.text.strip())
+    db.set_field(message.chat.id, "min_price", value)
+    await state.clear()
+    await message.answer(settings_text(db.get_user(message.chat.id)), reply_markup=main_menu(message.chat.id))
+
+
+@dp.message(InputStates.max_price)
+async def st_max_price(message: Message, state: FSMContext):
+    db.ensure_user(message.chat.id)
+    value = None if message.text.strip() == "-" else to_float(message.text.strip())
+    db.set_field(message.chat.id, "max_price", value)
+    await state.clear()
+    await message.answer(settings_text(db.get_user(message.chat.id)), reply_markup=main_menu(message.chat.id))
+
+
+async def send_listing_to_user(chat_id: int, item: dict):
+    buttons = []
+    if item.get("market_url"):
+        buttons.append([InlineKeyboardButton(text=f"Открыть на {item['provider']}", url=item["market_url"])])
+    if item.get("tme_url"):
+        buttons.append([InlineKeyboardButton(text="Открыть подарок", url=item["tme_url"])])
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    await bot.send_message(chat_id, listing_text(item), reply_markup=markup, disable_web_page_preview=False)
+
+
+async def poll_mrkt(api: MrktApi):
+    try:
+        result = await api.fetch_saling(count=PAGE_LIMIT)
+    except Exception as e:
+        logger.exception("MRKT fetch failed: %s", e)
+        return []
+    gifts = result.get("gifts", []) or []
+    out = []
+    for raw in reversed(gifts):
+        item = extract_from_mrkt(raw)
+        if db.seen(item["uniq"]):
+            continue
+        item["avg_sell_ton"] = await calc_avg_sell_mrkt(api, item)
+        out.append(item)
+    return out
+
+
+async def monitor_loop():
+    if not BOT_TOKEN or not API_ID or not API_HASH:
+        raise RuntimeError("Заполни BOT_TOKEN, API_ID, API_HASH в .env")
+    db.init()
+    logger.info("No paid API mode started. Interval=%s sec", CHECK_INTERVAL)
     async with MrktApi() as api:
-        logger.info("MRKT monitor started. Interval=%s sec", CHECK_INTERVAL)
+        if STARTUP_TEST and OWNER_CHAT_ID:
+            await bot.send_message(OWNER_CHAT_ID, "Бот запущен в режиме без платного API.")
         while True:
-            try:
-                users = db.list_active_users()
-                if not users:
-                    logger.info("Подписчиков пока нет")
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-
-                gifts = await api.fetch_saling(count=20)
-                logger.info("Получено подарков: %s", len(gifts))
-                for item in reversed(gifts):
-                    uid = extract_unique_id(item)
-                    if db.is_seen(uid):
-                        continue
-                    db.mark_seen(uid)
-
-                    for chat_id in users:
-                        f = db.get_filter(chat_id)
-                        if filter_matches(item, f):
-                            try:
-                                await send_item(bot, chat_id, item)
-                            except Exception as e:
-                                logger.warning("Не удалось отправить %s: %s", chat_id, e)
-
-            except Exception as e:
-                logger.exception("Ошибка мониторинга: %s", e)
-
+            subscribers = db.subscribers()
+            if not subscribers:
+                logger.info("Подписчиков пока нет")
+            items = await poll_mrkt(api)
+            if items:
+                logger.info("Новых листингов: %s", len(items))
+            for item in items:
+                for user in subscribers:
+                    if user_matches(user, item):
+                        try:
+                            await send_listing_to_user(int(user["chat_id"]), item)
+                        except Exception as e:
+                            logger.warning("send failed to %s: %s", user['chat_id'], e)
+                db.mark_seen(item["uniq"])
             await asyncio.sleep(CHECK_INTERVAL)
 
 
-router = Router()
-
-
-@router.message(Command("start"))
-async def cmd_start(message: Message):
-    db.upsert_user(message.chat.id)
-    text = (
-        "Это бот для уведомлений о выходах подарков.\n\n"
-        "Фильтры настраиваются через меню ниже:\n"
-        "— подарок\n"
-        "— модель\n"
-        "— фон\n"
-        "— цена\n"
-        "— маркеты\n\n"
-        "Сейчас реально активен источник MRKT.\n"
-        "Tonnel / GetGems / Portals уже добавлены в меню как фильтры-интерфейс, "
-        "но без стабильных публичных эндпоинтов я не могу честно обещать рабочий парсинг всех этих маркетов в этой версии."
-    )
-    await message.answer(text, reply_markup=main_menu(message.chat.id))
-
-
-@router.message(Command("menu"))
-async def cmd_menu(message: Message):
-    db.upsert_user(message.chat.id)
-    await message.answer(filters_text(message.chat.id), reply_markup=main_menu(message.chat.id))
-
-
-@router.callback_query(F.data == "show:filters")
-async def cb_show_filters(call: CallbackQuery):
-    await call.message.edit_text(filters_text(call.message.chat.id), reply_markup=main_menu(call.message.chat.id))
-    await call.answer()
-
-
-@router.callback_query(F.data == "reset:filters")
-async def cb_reset_filters(call: CallbackQuery):
-    db.reset_filters(call.message.chat.id)
-    await call.message.edit_text("Фильтры сброшены.\n\n" + filters_text(call.message.chat.id), reply_markup=main_menu(call.message.chat.id))
-    await call.answer("Сброшено")
-
-
-@router.callback_query(F.data.startswith("market:"))
-async def cb_market(call: CallbackQuery):
-    market = call.data.split(":", 1)[1]
-    db.toggle_market(call.message.chat.id, market)
-    await call.message.edit_text(filters_text(call.message.chat.id), reply_markup=main_menu(call.message.chat.id))
-    await call.answer("Обновлено")
-
-
-@router.callback_query(F.data == "set:gift")
-async def cb_set_gift(call: CallbackQuery, state: FSMContext):
-    await state.set_state(InputStates.gift)
-    await call.message.answer("Введи подарок вручную.\nПример: Jester Hat")
-    await call.answer()
-
-@router.callback_query(F.data == "set:model")
-async def cb_set_model(call: CallbackQuery, state: FSMContext):
-    await state.set_state(InputStates.model)
-    await call.message.answer("Введи модель вручную.\nПример: Lava Viper")
-    await call.answer()
-
-@router.callback_query(F.data == "set:backdrop")
-async def cb_set_backdrop(call: CallbackQuery, state: FSMContext):
-    await state.set_state(InputStates.backdrop)
-    await call.message.answer("Введи фон вручную.\nПример: Copper")
-    await call.answer()
-
-@router.callback_query(F.data == "set:price")
-async def cb_set_price(call: CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Мин. цена", callback_data="set:min_price"),
-         InlineKeyboardButton(text="Макс. цена", callback_data="set:max_price")]
-    ])
-    await call.message.answer("Что хочешь ввести?", reply_markup=kb)
-    await call.answer()
-
-@router.callback_query(F.data == "set:min_price")
-async def cb_set_min_price(call: CallbackQuery, state: FSMContext):
-    await state.set_state(InputStates.min_price)
-    await call.message.answer("Введи минимальную цену в TON. Пример: 2.5\nНапиши 0 чтобы убрать.")
-    await call.answer()
-
-@router.callback_query(F.data == "set:max_price")
-async def cb_set_max_price(call: CallbackQuery, state: FSMContext):
-    await state.set_state(InputStates.max_price)
-    await call.message.answer("Введи максимальную цену в TON. Пример: 10\nНапиши 0 чтобы убрать.")
-    await call.answer()
-
-@router.message(InputStates.gift)
-async def state_gift(message: Message, state: FSMContext):
-    db.update_filter_value(message.chat.id, "gift_name", message.text.strip())
-    await state.clear()
-    await message.answer("Фильтр по подарку обновлён.\n\n" + filters_text(message.chat.id), reply_markup=main_menu(message.chat.id))
-
-@router.message(InputStates.model)
-async def state_model(message: Message, state: FSMContext):
-    db.update_filter_value(message.chat.id, "model_name", message.text.strip())
-    await state.clear()
-    await message.answer("Фильтр по модели обновлён.\n\n" + filters_text(message.chat.id), reply_markup=main_menu(message.chat.id))
-
-@router.message(InputStates.backdrop)
-async def state_backdrop(message: Message, state: FSMContext):
-    db.update_filter_value(message.chat.id, "backdrop_name", message.text.strip())
-    await state.clear()
-    await message.answer("Фильтр по фону обновлён.\n\n" + filters_text(message.chat.id), reply_markup=main_menu(message.chat.id))
-
-@router.message(InputStates.min_price)
-async def state_min_price(message: Message, state: FSMContext):
-    text = message.text.strip().replace(",", ".")
-    val = None if text == "0" else float(text)
-    db.update_filter_value(message.chat.id, "min_price", val)
-    await state.clear()
-    await message.answer("Минимальная цена обновлена.\n\n" + filters_text(message.chat.id), reply_markup=main_menu(message.chat.id))
-
-@router.message(InputStates.max_price)
-async def state_max_price(message: Message, state: FSMContext):
-    text = message.text.strip().replace(",", ".")
-    val = None if text == "0" else float(text)
-    db.update_filter_value(message.chat.id, "max_price", val)
-    await state.clear()
-    await message.answer("Максимальная цена обновлена.\n\n" + filters_text(message.chat.id), reply_markup=main_menu(message.chat.id))
-
-
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN пустой")
-    if not API_ID or not API_HASH:
-        raise RuntimeError("API_ID/API_HASH пустые")
-    db.init()
-
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-
-    monitor = asyncio.create_task(monitor_loop(bot))
-    try:
-        await dp.start_polling(bot)
-    finally:
-        monitor.cancel()
-        with contextlib.suppress(Exception):
-            await monitor
+    monitor = asyncio.create_task(monitor_loop())
+    await dp.start_polling(bot)
+    await monitor
 
 
 if __name__ == "__main__":
-    import contextlib
     asyncio.run(main())
